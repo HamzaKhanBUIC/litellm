@@ -47,6 +47,7 @@ from litellm.proxy._experimental.mcp_server.client_allowlist import (
 )
 from litellm.proxy._experimental.mcp_server.discoverable_endpoints import (
     get_request_base_url,
+    store_per_user_token_server_side,
 )
 from litellm.proxy._experimental.mcp_server.exceptions import (
     MCPUpstreamAuthError,
@@ -68,8 +69,10 @@ from litellm.proxy._experimental.mcp_server.mcp_debug import (
     MCPDebug,
 )
 from litellm.proxy._experimental.mcp_server.oauth_utils import (
+    get_keyed_aggregate_resource_metadata_url,
     get_passthrough_www_authenticate,
     get_route_relative_request_path,
+    open_relay_claim_token,
     redact_mcp_resource_url,
     well_known_root_suffix,
 )
@@ -1829,6 +1832,43 @@ if MCP_AVAILABLE:
     from litellm.proxy._experimental.mcp_server.catalog import catalog_operation
 
     @catalog_operation(lambda: operations.global_mcp_server_manager)
+    async def _claim_relay_token_for_key(
+        scope: Scope,
+        server: MCPServer,
+        oauth2_headers: Mapping[str, str] | None,
+        user_api_key_auth: UserAPIKeyAuth | None,
+    ) -> bool:
+        """A keyed client whose OAuth fetches carry no litellm key finishes the per-server relay
+        holding a sealed claim token instead of the upstream credential. The key on this request
+        is the owner the relay could not see, so vault the credential for it under the same write
+        policy the token endpoint applies, then let the resolver confirm it can serve the egress."""
+        from litellm.proxy._experimental.mcp_server.bridge_token_flow import (  # noqa: PLC0415  # proxy import cycle
+            can_store_oauth_credential,
+        )
+
+        claim: Final = open_relay_claim_token(oauth2_headers.get("Authorization") if oauth2_headers else None)
+        if claim is None or claim.mcp_server_id != server.server_id or user_api_key_auth is None:
+            return False
+        user_id: Final = user_api_key_auth.user_id
+        if not user_id or not await can_store_oauth_credential(
+            StarletteRequest(scope), user_api_key_auth, server.server_id
+        ):
+            verbose_logger.warning(
+                "relay claim: the key on this request cannot store a per-user OAuth token for server=%s, "
+                "so the credential stays unclaimed and the client is challenged again",
+                server.server_id,
+            )
+            return False
+        await store_per_user_token_server_side(
+            server=server,
+            user_id=user_id,
+            token_response=dict(claim.token_response(int(time.time()))),
+            **({"cimd_client_id": claim.cimd_client_id} if claim.cimd_client_id is not None else {}),
+            requested_scope=claim.scope,
+        )
+        await operations.global_mcp_server_manager.invalidate_user_oauth_token_cache(user_id, server.server_id)
+        return await operations.global_mcp_server_manager.has_user_oauth_token(server, user_api_key_auth)
+
     async def _raise_preemptive_401_for_unauthenticated_servers(
         scope: Scope,
         mcp_servers: list[str] | None,
@@ -1892,6 +1932,8 @@ if MCP_AVAILABLE:
                     # authorization server is the gateway itself, vaulting via the
                     # authorize interlude); the per-server relay advertised below
                     # cannot vault without a litellm key on its token request.
+                    if await _claim_relay_token_for_key(scope, server, oauth2_headers, user_api_key_auth):
+                        continue
                     if await operations.global_mcp_server_manager.has_user_oauth_token(server, user_api_key_auth):
                         continue
 
@@ -1918,12 +1960,20 @@ if MCP_AVAILABLE:
                         _as_url = f"{as_metadata_root}/mcp/{server_name}"
                     else:
                         _as_url = f"{as_metadata_root}/{server_name}"
-                    authorization_uri = f'Bearer authorization_uri="{_as_url}"'
+                    authorization_uri = f'authorization_uri="{_as_url}"'
+                    # On the aggregate route the per-server relay is also reachable through RFC 9728
+                    # resource_metadata, the only hint standard clients follow.
+                    named_route = _path.startswith((f"/mcp/{server_name}", f"/{server_name}/"))
+                    resource_metadata = (
+                        ""
+                        if named_route
+                        else f'resource_metadata="{get_keyed_aggregate_resource_metadata_url(scope, server_name)}", '
+                    )
 
                     raise HTTPException(
                         status_code=401,
                         detail="Unauthorized",
-                        headers={"www-authenticate": authorization_uri},
+                        headers={"www-authenticate": f"Bearer {resource_metadata}{authorization_uri}"},
                     )
 
                 if not oauth2_headers:
